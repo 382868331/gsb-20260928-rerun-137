@@ -191,7 +191,7 @@ func TestNewProjectionRebuildsWhileOldProjectionRemainsQueryable(t *testing.T) {
 	if err := old.Replay(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := switcher.Switch("v1"); err != nil {
+	if err := switcher.Switch(ctx, "v1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := switcher.Rebuild(ctx, "v2"); err != nil {
@@ -206,7 +206,7 @@ func TestNewProjectionRebuildsWhileOldProjectionRemainsQueryable(t *testing.T) {
 	if err != nil || newState.Revenue != 10 || newVersion != 3 {
 		t.Fatalf("v2 state %+v version %d err %v", newState, newVersion, err)
 	}
-	if err := switcher.Switch("v2"); err != nil {
+	if err := switcher.Switch(ctx, "v2"); err != nil {
 		t.Fatal(err)
 	}
 	name, currentState, _, err = switcher.Current(ctx)

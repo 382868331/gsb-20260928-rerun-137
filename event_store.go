@@ -18,6 +18,7 @@ type UnsavedEvent struct {
 
 type RecordedEvent struct {
 	ID         int64           `json:"id"`
+	Position   int64           `json:"position"`
 	StreamID   string          `json:"stream_id"`
 	Version    int64           `json:"version"`
 	Type       string          `json:"type"`
@@ -85,12 +86,14 @@ func (s *MemoryEventStore) Append(ctx context.Context, streamID string, expected
 		eventVersion := actualVersion + int64(i) + 1
 		recordedEvent := RecordedEvent{
 			ID:         s.nextID.Add(1),
+			Position:   0,
 			StreamID:   streamID,
 			Version:    eventVersion,
 			Type:       event.Type,
 			Data:       payload,
 			OccurredAt: s.now().UTC(),
 		}
+		recordedEvent.Position = recordedEvent.ID
 		recorded = append(recorded, recordedEvent)
 	}
 
@@ -108,7 +111,10 @@ func (s *MemoryEventStore) ReadStreamAfter(ctx context.Context, streamID string,
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.readStreamAfterLocked(ctx, streamID, afterVersion)
+}
 
+func (s *MemoryEventStore) readStreamAfterLocked(ctx context.Context, streamID string, afterVersion int64) ([]RecordedEvent, error) {
 	history := s.streams[streamID]
 	if afterVersion < 0 {
 		return nil, fmt.Errorf("replay: after version cannot be negative")
@@ -123,10 +129,17 @@ func (s *MemoryEventStore) ReadStreamAfter(ctx context.Context, streamID string,
 }
 
 func (s *MemoryEventStore) StreamVersion(ctx context.Context, streamID string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.streamVersionLocked(ctx, streamID)
+}
+
+func (s *MemoryEventStore) streamVersionLocked(ctx context.Context, streamID string) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return int64(len(s.streams[streamID])), nil
 }
+
+func (s *MemoryEventStore) Lock()   { s.mu.Lock() }
+func (s *MemoryEventStore) Unlock() { s.mu.Unlock() }
