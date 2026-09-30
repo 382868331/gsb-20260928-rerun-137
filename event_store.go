@@ -29,7 +29,16 @@ type EventStore interface {
 	Append(ctx context.Context, streamID string, expectedVersion int64, events ...UnsavedEvent) ([]RecordedEvent, error)
 	ReadStream(ctx context.Context, streamID string) ([]RecordedEvent, error)
 	ReadStreamAfter(ctx context.Context, streamID string, afterVersion int64) ([]RecordedEvent, error)
+	ReadTail(ctx context.Context, streamID string, afterVersion int64) ([]RecordedEvent, int64, error)
 	StreamVersion(ctx context.Context, streamID string) (int64, error)
+}
+
+// AppendLocker serializes appends against projection cut-over. While the
+// returned unlock function runs, no append to any stream of the store can be
+// committed, so a projection can replay its tail and flip the current pointer
+// without losing events that arrive in between.
+type AppendLocker interface {
+	WithAppendLock(func() error) error
 }
 
 type ConcurrencyError struct {
@@ -103,23 +112,28 @@ func (s *MemoryEventStore) ReadStream(ctx context.Context, streamID string) ([]R
 }
 
 func (s *MemoryEventStore) ReadStreamAfter(ctx context.Context, streamID string, afterVersion int64) ([]RecordedEvent, error) {
+	events, _, err := s.ReadTail(ctx, streamID, afterVersion)
+	return events, err
+}
+
+func (s *MemoryEventStore) ReadTail(ctx context.Context, streamID string, afterVersion int64) ([]RecordedEvent, int64, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	history := s.streams[streamID]
 	if afterVersion < 0 {
-		return nil, fmt.Errorf("replay: after version cannot be negative")
+		return nil, 0, fmt.Errorf("replay: after version cannot be negative")
 	}
 	if afterVersion > int64(len(history)) {
-		return nil, fmt.Errorf("replay: checkpoint %d is ahead of stream %q version %d", afterVersion, streamID, len(history))
+		return nil, 0, fmt.Errorf("replay: checkpoint %d is ahead of stream %q version %d", afterVersion, streamID, len(history))
 	}
 
 	result := make([]RecordedEvent, len(history[afterVersion:]))
 	copy(result, history[afterVersion:])
-	return result, nil
+	return result, int64(len(history)), nil
 }
 
 func (s *MemoryEventStore) StreamVersion(ctx context.Context, streamID string) (int64, error) {
@@ -129,4 +143,13 @@ func (s *MemoryEventStore) StreamVersion(ctx context.Context, streamID string) (
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return int64(len(s.streams[streamID])), nil
+}
+
+// WithAppendLock takes the same mutex that protects appends and reads. The
+// memory store keeps a single mutex, so holding it here also makes ReadTail
+// views stable while a projection cuts over.
+func (s *MemoryEventStore) WithAppendLock(fn func() error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return fn()
 }
