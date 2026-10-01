@@ -33,12 +33,14 @@ type EventStore interface {
 	StreamVersion(ctx context.Context, streamID string) (int64, error)
 }
 
-// AppendLocker serializes appends against projection cut-over. While the
-// returned unlock function runs, no append to any stream of the store can be
-// committed, so a projection can replay its tail and flip the current pointer
-// without losing events that arrive in between.
+// AppendLocker serializes appends against projection cut-over. While fn
+// runs, no append to any stream of the store can be committed, so a
+// projection can replay its tail and flip the current pointer without losing
+// events that arrive in between. The EventStore passed to fn performs its
+// operations under the held lock and must be used (instead of the outer
+// store) for any reads or appends inside fn.
 type AppendLocker interface {
-	WithAppendLock(func() error) error
+	WithAppendLock(fn func(locked EventStore) error) error
 }
 
 type ConcurrencyError struct {
@@ -75,7 +77,10 @@ func (s *MemoryEventStore) Append(ctx context.Context, streamID string, expected
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.appendLocked(streamID, expectedVersion, events...)
+}
 
+func (s *MemoryEventStore) appendLocked(streamID string, expectedVersion int64, events ...UnsavedEvent) ([]RecordedEvent, error) {
 	history := s.streams[streamID]
 	actualVersion := int64(len(history))
 	if actualVersion != expectedVersion {
@@ -122,7 +127,10 @@ func (s *MemoryEventStore) ReadTail(ctx context.Context, streamID string, afterV
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.readTailLocked(streamID, afterVersion)
+}
 
+func (s *MemoryEventStore) readTailLocked(streamID string, afterVersion int64) ([]RecordedEvent, int64, error) {
 	history := s.streams[streamID]
 	if afterVersion < 0 {
 		return nil, 0, fmt.Errorf("replay: after version cannot be negative")
@@ -148,8 +156,41 @@ func (s *MemoryEventStore) StreamVersion(ctx context.Context, streamID string) (
 // WithAppendLock takes the same mutex that protects appends and reads. The
 // memory store keeps a single mutex, so holding it here also makes ReadTail
 // views stable while a projection cuts over.
-func (s *MemoryEventStore) WithAppendLock(fn func() error) error {
+func (s *MemoryEventStore) WithAppendLock(fn func(locked EventStore) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return fn()
+	return fn(memoryLockedView{store: s})
+}
+
+// memoryLockedView runs store operations while WithAppendLock holds the
+// store mutex; it must not escape the callback.
+type memoryLockedView struct {
+	store *MemoryEventStore
+}
+
+func (memoryLockedView) Append(context.Context, string, int64, ...UnsavedEvent) ([]RecordedEvent, error) {
+	return nil, fmt.Errorf("replay: appends are not allowed inside the append lock")
+}
+
+func (v memoryLockedView) ReadStream(ctx context.Context, streamID string) ([]RecordedEvent, error) {
+	return v.ReadStreamAfter(ctx, streamID, 0)
+}
+
+func (v memoryLockedView) ReadStreamAfter(ctx context.Context, streamID string, afterVersion int64) ([]RecordedEvent, error) {
+	events, _, err := v.ReadTail(ctx, streamID, afterVersion)
+	return events, err
+}
+
+func (v memoryLockedView) ReadTail(ctx context.Context, streamID string, afterVersion int64) ([]RecordedEvent, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	return v.store.readTailLocked(streamID, afterVersion)
+}
+
+func (v memoryLockedView) StreamVersion(ctx context.Context, streamID string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return int64(len(v.store.streams[streamID])), nil
 }

@@ -88,3 +88,41 @@ func (TinyStateModel[S]) Verify(expectedVersion, actualVersion int64, expectedSt
 	}
 	return nil
 }
+
+// Cutover replays the projection's remaining tail and atomically makes it the
+// current view while appends are held off by the store's append lock, so
+// events that arrive during the catch-up are neither lost nor applied twice.
+// The store must implement AppendLocker.
+func (p *ProjectionSwitch[S]) Cutover(ctx context.Context, name string) error {
+	locker, ok := p.store.(AppendLocker)
+	if !ok {
+		return fmt.Errorf("replay: event store %T does not support append locking", p.store)
+	}
+	p.mu.RLock()
+	projector, ok := p.views[name]
+	p.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("replay: projection %q is not registered", name)
+	}
+	return locker.WithAppendLock(func(locked EventStore) error {
+		if err := projector.ReplayFrom(ctx, locked); err != nil {
+			return err
+		}
+		p.mu.Lock()
+		p.current = name
+		p.mu.Unlock()
+		return nil
+	})
+}
+
+// RestoreSnapshot loads a snapshot into a registered projection so the next
+// Rebuild or Cutover only replays events appended after the snapshot.
+func (p *ProjectionSwitch[S]) RestoreSnapshot(name string, snapshot Snapshot[S]) error {
+	p.mu.RLock()
+	projector, ok := p.views[name]
+	p.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("replay: projection %q is not registered", name)
+	}
+	return projector.Restore(snapshot)
+}

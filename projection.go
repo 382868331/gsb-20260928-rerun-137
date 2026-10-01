@@ -37,7 +37,13 @@ func NewProjector[S any](store EventStore, streamID string, initialState S, hand
 }
 
 func (p *Projector[S]) Replay(ctx context.Context) error {
-	events, err := p.store.ReadStreamAfter(ctx, p.streamID, p.version)
+	return p.ReplayFrom(ctx, p.store)
+}
+
+// ReplayFrom replays the remaining tail from an alternate store view, such as
+// the locked view handed to an AppendLocker callback during cut-over.
+func (p *Projector[S]) ReplayFrom(ctx context.Context, store EventStore) error {
+	events, err := store.ReadStreamAfter(ctx, p.streamID, p.version)
 	if err != nil {
 		return err
 	}
