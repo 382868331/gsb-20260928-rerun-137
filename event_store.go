@@ -153,3 +153,19 @@ func (s *MemoryEventStore) WithAppendLock(fn func() error) error {
 	defer s.mu.Unlock()
 	return fn()
 }
+
+func (s *MemoryEventStore) readTailLocked(ctx context.Context, streamID string, afterVersion int64) ([]RecordedEvent, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	history := s.streams[streamID]
+	if afterVersion < 0 {
+		return nil, 0, fmt.Errorf("replay: after version cannot be negative")
+	}
+	if afterVersion > int64(len(history)) {
+		return nil, 0, fmt.Errorf("replay: checkpoint %d is ahead of stream %q version %d", afterVersion, streamID, len(history))
+	}
+	result := make([]RecordedEvent, len(history[afterVersion:]))
+	copy(result, history[afterVersion:])
+	return result, int64(len(history)), nil
+}
