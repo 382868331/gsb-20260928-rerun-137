@@ -19,20 +19,35 @@ import (
 //	[4-byte CRC32 of payload][4-byte payload length][JSON payload]
 //
 // and is only visible to readers after the frame is fully written and fsynced.
-// On open, the log is scanned and any incomplete or corrupt tail (for example
-// from a crash mid-append) is truncated, so an unfinished append is isolated
-// and never replayed as part of the confirmed history.
+// On open, the log is scanned and the two failure shapes are told apart:
+//
+//   - an incomplete tail (a crash mid-append) is truncated, so an unfinished
+//     append is isolated and never replayed as part of the confirmed history;
+//   - a complete frame whose checksum or payload is invalid is committed
+//     content that was damaged after confirmation. It is NOT truncated away:
+//     the store opens in a damaged state, keeps the corrupt bytes on disk,
+//     blocks further appends, and reports the Damage so an operator can
+//     reconcile it with saved trusted material (see recovery.go).
 type FileEventStore struct {
-	mu      sync.Mutex
-	path    string
-	log     *os.File
-	offset  int64
-	streams map[string][]RecordedEvent
-	nextID  int64
-	now     func() time.Time
+	mu            sync.Mutex
+	dir           string
+	path          string
+	log           *os.File
+	offset        int64
+	streams       map[string][]RecordedEvent
+	nextID        int64
+	damage        *Damage
+	truncatedTail bool
+	recovery      *RecoveryRecord
+	gaps          map[string][]VersionRange
+	now           func() time.Time
 }
 
 const frameHeaderSize = 8
+
+// maxFrameSize bounds a plausible frame length. A length header beyond this
+// is treated as committed corruption, not as an unfinished write.
+const maxFrameSize = 1 << 26
 
 // OpenFileEventStore opens (or creates) the event log in dir and recovers the
 // confirmed history, truncating any unconfirmed tail.
@@ -46,12 +61,18 @@ func OpenFileEventStore(dir string) (*FileEventStore, error) {
 		return nil, fmt.Errorf("replay: open event log: %w", err)
 	}
 	store := &FileEventStore{
+		dir:     dir,
 		path:    path,
 		log:     log,
 		streams: make(map[string][]RecordedEvent),
+		gaps:    make(map[string][]VersionRange),
 		now:     time.Now,
 	}
 	if err := store.recover(); err != nil {
+		log.Close()
+		return nil, err
+	}
+	if err := store.loadRecoveryRecord(); err != nil {
 		log.Close()
 		return nil, err
 	}
@@ -77,6 +98,12 @@ func (s *FileEventStore) recover() error {
 		}
 		checksum := binary.BigEndian.Uint32(header[:4])
 		length := binary.BigEndian.Uint32(header[4:])
+		if length > maxFrameSize {
+			// An implausible length header means a confirmed frame was
+			// damaged on disk, not a crash mid-append.
+			s.setDamage(Damage{Offset: offset, Reason: "frame length header is implausible"})
+			break
+		}
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(s.log, payload); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -85,11 +112,13 @@ func (s *FileEventStore) recover() error {
 			return fmt.Errorf("replay: read event log: %w", err)
 		}
 		if crc32.ChecksumIEEE(payload) != checksum {
-			return s.truncate(offset)
+			s.setDamage(Damage{Offset: offset, Length: int64(length), Reason: "checksum mismatch on a complete committed frame"})
+			break
 		}
 		var event RecordedEvent
 		if err := json.Unmarshal(payload, &event); err != nil {
-			return s.truncate(offset)
+			s.setDamage(Damage{Offset: offset, Length: int64(length), Reason: "committed frame payload is not valid JSON"})
+			break
 		}
 		s.streams[event.StreamID] = append(s.streams[event.StreamID], event)
 		if event.ID > s.nextID {
@@ -99,6 +128,12 @@ func (s *FileEventStore) recover() error {
 	}
 	s.offset = offset
 	return nil
+}
+
+// setDamage records committed corruption found during recovery. The damaged
+// bytes stay on disk untouched so the operator keeps the evidence.
+func (s *FileEventStore) setDamage(d Damage) {
+	s.damage = &d
 }
 
 // truncate isolates an unconfirmed tail: everything from offset onward is
@@ -114,6 +149,7 @@ func (s *FileEventStore) truncate(offset int64) error {
 		return fmt.Errorf("replay: seek event log: %w", err)
 	}
 	s.offset = offset
+	s.truncatedTail = true
 	return nil
 }
 
@@ -131,8 +167,11 @@ func (s *FileEventStore) Append(ctx context.Context, streamID string, expectedVe
 }
 
 func (s *FileEventStore) appendLocked(streamID string, expectedVersion int64, events ...UnsavedEvent) ([]RecordedEvent, error) {
+	if s.damage != nil {
+		return nil, fmt.Errorf("replay: event log has committed corruption at offset %d (%s); resolve it through recovery before appending", s.damage.Offset, s.damage.Reason)
+	}
 	history := s.streams[streamID]
-	actualVersion := int64(len(history))
+	actualVersion := headVersionLocked(history)
 	if actualVersion != expectedVersion {
 		return nil, ConcurrencyError{StreamID: streamID, ExpectedVersion: expectedVersion, ActualVersion: actualVersion}
 	}
@@ -203,16 +242,23 @@ func (s *FileEventStore) ReadTail(ctx context.Context, streamID string, afterVer
 
 func (s *FileEventStore) readTailLocked(streamID string, afterVersion int64) ([]RecordedEvent, int64, error) {
 	history := s.streams[streamID]
+	head := headVersionLocked(history)
 	if afterVersion < 0 {
 		return nil, 0, fmt.Errorf("replay: after version cannot be negative")
 	}
-	if afterVersion > int64(len(history)) {
-		return nil, 0, fmt.Errorf("replay: checkpoint %d is ahead of stream %q version %d", afterVersion, streamID, len(history))
+	if afterVersion > head {
+		return nil, 0, fmt.Errorf("replay: checkpoint %d is ahead of stream %q version %d", afterVersion, streamID, head)
 	}
 
-	result := make([]RecordedEvent, len(history[afterVersion:]))
-	copy(result, history[afterVersion:])
-	return result, int64(len(history)), nil
+	// Filter by recorded version rather than slicing by position: a recovery
+	// branch may carry gaps where no trusted material could cover a version.
+	result := make([]RecordedEvent, 0, len(history))
+	for _, event := range history {
+		if event.Version > afterVersion {
+			result = append(result, event)
+		}
+	}
+	return result, head, nil
 }
 
 func (s *FileEventStore) StreamVersion(ctx context.Context, streamID string) (int64, error) {
@@ -221,7 +267,17 @@ func (s *FileEventStore) StreamVersion(ctx context.Context, streamID string) (in
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return int64(len(s.streams[streamID])), nil
+	return headVersionLocked(s.streams[streamID]), nil
+}
+
+// headVersionLocked reports the highest confirmed version of a stream. For a
+// continuous history this equals the event count; for a recovery branch with
+// gaps it is the version of the last confirmed event.
+func headVersionLocked(history []RecordedEvent) int64 {
+	if len(history) == 0 {
+		return 0
+	}
+	return history[len(history)-1].Version
 }
 
 // WithAppendLock takes the same mutex that protects appends and reads, so a
@@ -263,7 +319,7 @@ func (v fileLockedView) StreamVersion(ctx context.Context, streamID string) (int
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	return int64(len(v.store.streams[streamID])), nil
+	return headVersionLocked(v.store.streams[streamID]), nil
 }
 
 // Close flushes and closes the event log.
