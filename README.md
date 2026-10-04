@@ -5,7 +5,9 @@
 ## 核心能力
 
 - 事件追加按流内版本做乐观并发检查，版本不匹配返回 `ConcurrencyError`。
-- `FileEventStore` 把事件持久化到追加日志（CRC 帧 + fsync），确认的事件在进程重启后仍可找回；重开时截断不完整或校验失败的尾部，未确认事件不会被当成历史。
+- `FileEventStore` 把事件持久化到追加日志（CRC 帧 + fsync），确认的事件在进程重启后仍可找回；重开时截断不完整的尾部（未确认的半写入不会被当成历史），但完整记录的校验失败属于已确认内容损坏：不再静默截断，而是保留原文件、记录 `CorruptionReport`（同时落盘 `events.corruption.json`），以降级视图打开并拒绝新追加，等待操作者处理。
+- 恢复走候选流程：`BuildRecoveryCandidate` 根据另存的可信材料核对可恢复范围，无法连续恢复的区间保留为缺口（`RecoveryGap`），与已确认前缀或另一份材料冲突的内容报告为 `RecoveryConflict`，绝不补造连续历史；操作者确认后 `CommitRecovery` 写入独立分支日志和清单（`events.recovery-N.log/.json`），原文件、原确认范围和恢复依据全部保留。
+- 每次读取都能说明视图归属：`View()` / `ReadStreamView()` 返回 `ViewInfo`，区分原始视图、降级视图和恢复分支视图，重开之后仍然可分辨。
 - `FileSnapshotStore` 先写临时文件、fsync 再原子 rename 发布快照；写入、发布或切换任一阶段中断都保留上一份可用快照。
 - 投影严格要求事件版本连续，坏事件处理失败后立即停止，不越过事件继续提交。
 - 新投影可以从完整历史重建；切换前旧投影仍作为当前查询视图。

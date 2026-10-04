@@ -24,15 +24,24 @@ import (
 // and never replayed as part of the confirmed history.
 type FileEventStore struct {
 	mu      sync.Mutex
+	dir     string
 	path    string
 	log     *os.File
 	offset  int64
+	history []RecordedEvent
 	streams map[string][]RecordedEvent
 	nextID  int64
 	now     func() time.Time
+
+	corruption *CorruptionReport
+	recovery   *RecoveryManifest
 }
 
 const frameHeaderSize = 8
+
+// originalLogName is the file the operator's confirmed history lives in; a
+// committed recovery never modifies it and writes its own branch log.
+const originalLogName = "events.log"
 
 // OpenFileEventStore opens (or creates) the event log in dir and recovers the
 // confirmed history, truncating any unconfirmed tail.
@@ -40,12 +49,13 @@ func OpenFileEventStore(dir string) (*FileEventStore, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("replay: create event store dir: %w", err)
 	}
-	path := filepath.Join(dir, "events.log")
+	path := filepath.Join(dir, originalLogName)
 	log, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("replay: open event log: %w", err)
 	}
 	store := &FileEventStore{
+		dir:     dir,
 		path:    path,
 		log:     log,
 		streams: make(map[string][]RecordedEvent),
@@ -59,46 +69,112 @@ func OpenFileEventStore(dir string) (*FileEventStore, error) {
 }
 
 func (s *FileEventStore) recover() error {
-	if _, err := s.log.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("replay: seek event log: %w", err)
+	scan, err := scanFrames(s.log)
+	if err != nil {
+		return err
+	}
+	s.applyScan(scan)
+	switch {
+	case scan.corruptOffset >= 0:
+		// A complete frame is damaged: confirmed content, not an
+		// unfinished write. Preserve the file exactly as it is, record the
+		// corruption for the operator, and open in the degraded view.
+		info, statErr := s.log.Stat()
+		if statErr != nil {
+			return fmt.Errorf("replay: stat event log: %w", statErr)
+		}
+		s.corruption = &CorruptionReport{
+			Offset:         scan.corruptOffset,
+			Reason:         scan.corruptReason,
+			ConfirmedBytes: scan.confirmedBytes,
+			PreservedBytes: info.Size() - scan.corruptOffset,
+		}
+		s.offset = scan.confirmedBytes
+		if err := s.persistCorruptionReport(); err != nil {
+			return err
+		}
+	case scan.incompleteTail:
+		// A partial frame at the end is an unconfirmed write; isolate it.
+		if err := s.truncate(scan.confirmedBytes); err != nil {
+			return err
+		}
+	default:
+		s.offset = scan.confirmedBytes
+	}
+	return s.loadRecoveryBranch()
+}
+
+// frameScan is the result of scanning a framed event log.
+type frameScan struct {
+	events         []RecordedEvent
+	nextID         int64
+	confirmedBytes int64
+	corruptOffset  int64
+	corruptReason  string
+	incompleteTail bool
+}
+
+// scanFrames reads every frame of f and classifies how the log ends: clean,
+// an incomplete tail (unconfirmed write), or a corrupt complete frame
+// (damaged confirmed content).
+func scanFrames(f *os.File) (frameScan, error) {
+	scan := frameScan{corruptOffset: -1}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return scan, fmt.Errorf("replay: seek event log: %w", err)
 	}
 	var offset int64
 	for {
 		header := make([]byte, frameHeaderSize)
-		n, err := io.ReadFull(s.log, header)
+		n, err := io.ReadFull(f, header)
 		if err == io.EOF && n == 0 {
 			break
 		}
 		if err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				return s.truncate(offset)
+				scan.incompleteTail = true
+				break
 			}
-			return fmt.Errorf("replay: read event log: %w", err)
+			return scan, fmt.Errorf("replay: read event log: %w", err)
 		}
 		checksum := binary.BigEndian.Uint32(header[:4])
 		length := binary.BigEndian.Uint32(header[4:])
 		payload := make([]byte, length)
-		if _, err := io.ReadFull(s.log, payload); err != nil {
+		if _, err := io.ReadFull(f, payload); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				return s.truncate(offset)
+				scan.incompleteTail = true
+				break
 			}
-			return fmt.Errorf("replay: read event log: %w", err)
+			return scan, fmt.Errorf("replay: read event log: %w", err)
 		}
 		if crc32.ChecksumIEEE(payload) != checksum {
-			return s.truncate(offset)
+			scan.corruptOffset = offset
+			scan.corruptReason = "checksum mismatch on a complete frame"
+			break
 		}
 		var event RecordedEvent
 		if err := json.Unmarshal(payload, &event); err != nil {
-			return s.truncate(offset)
+			scan.corruptOffset = offset
+			scan.corruptReason = "complete frame does not decode: " + err.Error()
+			break
 		}
-		s.streams[event.StreamID] = append(s.streams[event.StreamID], event)
-		if event.ID > s.nextID {
-			s.nextID = event.ID
+		scan.events = append(scan.events, event)
+		if event.ID > scan.nextID {
+			scan.nextID = event.ID
 		}
 		offset += frameHeaderSize + int64(length)
 	}
-	s.offset = offset
-	return nil
+	scan.confirmedBytes = offset
+	return scan, nil
+}
+
+// applyScan replaces the in-memory history with a scan result.
+func (s *FileEventStore) applyScan(scan frameScan) {
+	s.history = append([]RecordedEvent(nil), scan.events...)
+	s.streams = make(map[string][]RecordedEvent)
+	for _, event := range scan.events {
+		s.streams[event.StreamID] = append(s.streams[event.StreamID], event)
+	}
+	s.nextID = scan.nextID
 }
 
 // truncate isolates an unconfirmed tail: everything from offset onward is
@@ -131,6 +207,9 @@ func (s *FileEventStore) Append(ctx context.Context, streamID string, expectedVe
 }
 
 func (s *FileEventStore) appendLocked(streamID string, expectedVersion int64, events ...UnsavedEvent) ([]RecordedEvent, error) {
+	if s.corruption != nil && s.recovery == nil {
+		return nil, CorruptedHistoryError{Report: *s.corruption}
+	}
 	history := s.streams[streamID]
 	actualVersion := int64(len(history))
 	if actualVersion != expectedVersion {
@@ -180,6 +259,7 @@ func (s *FileEventStore) appendLocked(streamID string, expectedVersion int64, ev
 	}
 	s.offset = committedOffset + int64(len(buf))
 	s.streams[streamID] = append(history, recorded...)
+	s.history = append(s.history, recorded...)
 	return recorded, nil
 }
 
@@ -264,6 +344,46 @@ func (v fileLockedView) StreamVersion(ctx context.Context, streamID string) (int
 		return 0, err
 	}
 	return int64(len(v.store.streams[streamID])), nil
+}
+
+// View describes which history the store is currently serving: the clean
+// original log, the degraded original log (corrupt confirmed content, not
+// yet recovered), or a recovery branch committed by the operator.
+func (s *FileEventStore) View() ViewInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.viewLocked()
+}
+
+func (s *FileEventStore) viewLocked() ViewInfo {
+	view := ViewInfo{Kind: ViewOriginal, ActiveFile: s.path, OriginalFile: filepath.Join(s.dir, originalLogName)}
+	if s.corruption != nil {
+		report := *s.corruption
+		view.Corruption = &report
+		view.Kind = ViewDegraded
+	}
+	if s.recovery != nil {
+		manifest := *s.recovery
+		view.Recovery = &manifest
+		view.Kind = ViewRecoveryBranch
+	}
+	return view
+}
+
+// ReadStreamView reads the stream like ReadStream and also reports which
+// view the returned events belong to, so callers never mistake a degraded
+// or recovered history for the clean original.
+func (s *FileEventStore) ReadStreamView(ctx context.Context, streamID string) ([]RecordedEvent, ViewInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, ViewInfo{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	events, _, err := s.readTailLocked(streamID, 0)
+	if err != nil {
+		return nil, ViewInfo{}, err
+	}
+	return events, s.viewLocked(), nil
 }
 
 // Close flushes and closes the event log.

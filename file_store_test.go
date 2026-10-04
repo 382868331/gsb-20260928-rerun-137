@@ -123,23 +123,9 @@ func TestFileStoreIsolatesIncompleteTail(t *testing.T) {
 	}
 }
 
-func TestFileStoreDropsCorruptFrame(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	streamID := "shop:device-corrupt"
-
-	store, err := replay.OpenFileEventStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	appendEvent(t, store, streamID, replay.NoStreamVersion, addTea())
-	appendEvent(t, store, streamID, 1, addTea())
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	// Corrupt one byte inside the second frame's payload.
-	logPath := filepath.Join(dir, "events.log")
+// corruptLastFrameByte flips one byte inside the payload of the last frame.
+func corruptLastFrameByte(t *testing.T, logPath string) {
+	t.Helper()
 	info, err := os.Stat(logPath)
 	if err != nil {
 		t.Fatal(err)
@@ -154,15 +140,66 @@ func TestFileStoreDropsCorruptFrame(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestFileStoreReportsCorruptConfirmedRecord(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	streamID := "shop:device-corrupt"
+
+	store, err := replay.OpenFileEventStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendEvent(t, store, streamID, replay.NoStreamVersion, addTea())
+	appendEvent(t, store, streamID, 1, addTea())
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Damage the second, already confirmed record.
+	logPath := filepath.Join(dir, "events.log")
+	info, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalSize := info.Size()
+	corruptLastFrameByte(t, logPath)
 
 	reopened, err := replay.OpenFileEventStore(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	version, err := reopened.StreamVersion(ctx, streamID)
-	if err != nil || version != 1 {
-		t.Fatalf("version = %d, err = %v; corrupt tail must not be replayed", version, err)
+
+	// The confirmed prefix is served, but the view must say it is degraded.
+	events, view, err := reopened.ReadStreamView(ctx, streamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want confirmed prefix of 1", len(events))
+	}
+	if view.Kind != replay.ViewDegraded {
+		t.Fatalf("view = %q, want %q", view.Kind, replay.ViewDegraded)
+	}
+	if view.Corruption == nil || view.Corruption.PreservedBytes <= 0 {
+		t.Fatalf("corruption report missing: %+v", view.Corruption)
+	}
+
+	// The damaged file is preserved for the operator, not truncated away.
+	if info, err := os.Stat(logPath); err != nil || info.Size() != originalSize {
+		t.Fatalf("original log changed: size %v, err %v", info, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "events.corruption.json")); err != nil {
+		t.Fatalf("persisted corruption report missing: %v", err)
+	}
+
+	// Appends are blocked while confirmed content is corrupt.
+	if _, err := reopened.Append(ctx, streamID, 1, addTea()); err == nil {
+		t.Fatal("expected append to be blocked on corrupt confirmed history")
+	} else if _, ok := err.(replay.CorruptedHistoryError); !ok {
+		t.Fatalf("error = %T, want CorruptedHistoryError", err)
 	}
 }
 
