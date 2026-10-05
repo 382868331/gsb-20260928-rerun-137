@@ -57,9 +57,12 @@ type MaterialConflict struct {
 // RecoveryCandidate is the recoverable view of a damaged stream: the prefix
 // confirmed in the original log, the versions trusted material can vouch
 // for, and the gaps nothing could cover. Gaps are kept as gaps; the
-// candidate never fabricates a continuous history.
+// candidate never fabricates a continuous history. Version identifies the
+// candidate revision: supplementary material forms a new version instead of
+// silently rewriting the one under review.
 type RecoveryCandidate struct {
 	StreamID  string
+	Version   int
 	Confirmed []RecordedEvent
 	Recovered []RecordedEvent
 	Gaps      []VersionRange
@@ -78,6 +81,9 @@ type RecoveryRecord struct {
 	Gaps             []VersionRange    `json:"gaps,omitempty"`
 	RecoveredThrough int64             `json:"recovered_through"`
 	RecoveredAt      time.Time         `json:"recovered_at"`
+	Generation       int               `json:"generation,omitempty"`
+	CandidateVersion int               `json:"candidate_version,omitempty"`
+	Decisions        []ReviewDecision  `json:"decisions,omitempty"`
 }
 
 // ViewKind identifies which history a read result belongs to.
@@ -99,6 +105,7 @@ type StreamView struct {
 	Damage   *Damage
 	Gaps     []VersionRange
 	Recovery *RecoveryRecord
+	Review   *ReviewState
 }
 
 // ViewedEvents pairs read events with the view they belong to.
@@ -154,6 +161,10 @@ func (s *FileEventStore) viewLocked(streamID string) StreamView {
 	if gaps := s.gaps[streamID]; len(gaps) > 0 {
 		view.Gaps = append([]VersionRange(nil), gaps...)
 	}
+	if s.review != nil && s.review.StreamID == streamID {
+		review := s.reviewStateLocked()
+		view.Review = &review
+	}
 	return view
 }
 
@@ -176,11 +187,19 @@ func (s *FileEventStore) ReadStreamWithView(ctx context.Context, streamID string
 // log and returns the recoverable view of the stream. Versions no material
 // covers — or that materials disagree on — stay gaps. Material that
 // contradicts the already confirmed prefix is reported as a conflict.
+//
+// After a recovery branch is confirmed, supplementary material can still be
+// checked against the remaining gaps: the candidate then covers the branch
+// plus the newly recoverable versions, and it forms a new candidate version
+// instead of silently rewriting the confirmed branch.
 func (s *FileEventStore) BuildRecoveryCandidate(streamID string, materials ...RecoveryMaterial) (RecoveryCandidate, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.damage == nil {
+	if s.damage == nil && s.recovery == nil {
 		return RecoveryCandidate{}, fmt.Errorf("replay: no committed corruption to recover from")
+	}
+	if s.recovery != nil && len(s.gaps[streamID]) == 0 {
+		return RecoveryCandidate{}, fmt.Errorf("replay: recovery branch for stream %q has no remaining gaps", streamID)
 	}
 	confirmed := append([]RecordedEvent(nil), s.streams[streamID]...)
 	candidate := RecoveryCandidate{StreamID: streamID, Confirmed: confirmed}
@@ -202,13 +221,18 @@ func (s *FileEventStore) BuildRecoveryCandidate(streamID string, materials ...Re
 		}
 	}
 
-	// Material must not contradict the prefix the original log confirmed.
+	// Material must not contradict what the current branch already confirms.
+	confirmedByVersion := make(map[int64]RecordedEvent, len(confirmed))
+	for _, event := range confirmed {
+		confirmedByVersion[event.Version] = event
+	}
 	for version, events := range byVersion {
-		if version > confirmedThrough {
+		confirmedEvent, ok := confirmedByVersion[version]
+		if !ok {
 			continue
 		}
 		for _, event := range events {
-			if !recordedEventsEqual(event, confirmed[version-1]) {
+			if !recordedEventsEqual(event, confirmedEvent) {
 				candidate.Conflicts = append(candidate.Conflicts, MaterialConflict{
 					StreamID: streamID,
 					Version:  version,
@@ -219,34 +243,51 @@ func (s *FileEventStore) BuildRecoveryCandidate(streamID string, materials ...Re
 		}
 	}
 
-	for version := confirmedThrough + 1; version <= maxVersion; version++ {
-		events := byVersion[version]
-		if len(events) == 0 {
-			candidate.Gaps = appendGap(candidate.Gaps, version)
-			continue
+	// The versions a candidate may fill: everything past the confirmed
+	// prefix of a damaged log, or only the remaining gaps of a recovery
+	// branch.
+	var pending []VersionRange
+	if s.damage != nil {
+		if maxVersion > confirmedThrough {
+			pending = append(pending, VersionRange{From: confirmedThrough + 1, To: maxVersion})
 		}
-		agreed := events[0]
-		conflict := false
-		for _, event := range events[1:] {
-			if !recordedEventsEqual(event, agreed) {
-				conflict = true
-				break
+	} else {
+		pending = s.gaps[streamID]
+	}
+	for _, r := range pending {
+		for version := r.From; version <= r.To; version++ {
+			events := byVersion[version]
+			if len(events) == 0 {
+				candidate.Gaps = appendGap(candidate.Gaps, version)
+				continue
 			}
+			agreed := events[0]
+			conflict := false
+			for _, event := range events[1:] {
+				if !recordedEventsEqual(event, agreed) {
+					conflict = true
+					break
+				}
+			}
+			if conflict {
+				candidate.Conflicts = append(candidate.Conflicts, MaterialConflict{
+					StreamID: streamID,
+					Version:  version,
+					Sources:  sourcesByVersion[version],
+				})
+				candidate.Gaps = appendGap(candidate.Gaps, version)
+				continue
+			}
+			candidate.Recovered = append(candidate.Recovered, agreed)
 		}
-		if conflict {
-			candidate.Conflicts = append(candidate.Conflicts, MaterialConflict{
-				StreamID: streamID,
-				Version:  version,
-				Sources:  sourcesByVersion[version],
-			})
-			candidate.Gaps = appendGap(candidate.Gaps, version)
-			continue
-		}
-		candidate.Recovered = append(candidate.Recovered, agreed)
 	}
 	sort.Slice(candidate.Conflicts, func(i, j int) bool {
 		return candidate.Conflicts[i].Version < candidate.Conflicts[j].Version
 	})
+	if err := s.trackCandidateLocked(streamID, candidate, materials); err != nil {
+		return RecoveryCandidate{}, err
+	}
+	candidate.Version = s.review.CandidateVersion
 	return candidate, nil
 }
 
@@ -255,10 +296,15 @@ func (s *FileEventStore) BuildRecoveryCandidate(streamID string, materials ...Re
 // record keeps the original confirmed range, the damage, and the material
 // the recovery relied on. After confirmation the store serves the recovery
 // view and accepts new appends on top of the recovered head.
+// When review decisions exist, every recovered version must be explicitly
+// accepted or rejected; deferred versions block confirmation. Once a branch
+// is confirmed, supplementary material can only be confirmed through a new
+// candidate version with its own explicit decisions, so a confirmed branch
+// is never silently rewritten.
 func (s *FileEventStore) ConfirmRecovery(candidate RecoveryCandidate, materials ...RecoveryMaterial) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.damage == nil {
+	if s.damage == nil && s.recovery == nil {
 		return fmt.Errorf("replay: no committed corruption to recover from")
 	}
 	streamID := candidate.StreamID
@@ -266,12 +312,55 @@ func (s *FileEventStore) ConfirmRecovery(candidate RecoveryCandidate, materials 
 	if !reflect.DeepEqual(candidate.Confirmed, confirmed) {
 		return fmt.Errorf("replay: recovery candidate for stream %q does not match the confirmed prefix; rebuild it before confirming", streamID)
 	}
+	underReview := s.review != nil && s.review.StreamID == streamID
+	if underReview && candidate.Version != s.review.CandidateVersion {
+		return fmt.Errorf("replay: candidate version %d is stale; current version is %d", candidate.Version, s.review.CandidateVersion)
+	}
 
-	branch := make([]RecordedEvent, 0, len(confirmed)+len(candidate.Recovered))
+	accepted := make([]RecordedEvent, 0, len(candidate.Recovered))
+	gaps := append([]VersionRange(nil), candidate.Gaps...)
+	hasDecisions := underReview && len(s.review.Decisions) > 0
+	for _, event := range candidate.Recovered {
+		var decision *ReviewDecision
+		if underReview {
+			decision = s.decisionForVersionLocked(event.Version)
+		}
+		if decision == nil {
+			if s.recovery != nil {
+				return fmt.Errorf("replay: version %d has no review decision; a confirmed recovery branch is never silently rewritten", event.Version)
+			}
+			if hasDecisions {
+				return fmt.Errorf("replay: version %d has no review decision; submit accept or reject before confirming", event.Version)
+			}
+			accepted = append(accepted, event)
+			continue
+		}
+		switch decision.Kind {
+		case DecisionAccept:
+			accepted = append(accepted, event)
+		case DecisionReject:
+			gaps = appendGap(gaps, event.Version)
+		case DecisionDefer:
+			return fmt.Errorf("replay: version %d is deferred; resolve the deferral before confirming", event.Version)
+		}
+	}
+	if underReview {
+		for _, gap := range candidate.Gaps {
+			for version := gap.From; version <= gap.To; version++ {
+				if d := s.decisionForVersionLocked(version); d != nil && d.Kind == DecisionDefer {
+					return fmt.Errorf("replay: version %d is deferred; resolve the deferral before confirming", version)
+				}
+			}
+		}
+	}
+	gaps = normalizeGaps(gaps)
+
+	branch := make([]RecordedEvent, 0, len(confirmed)+len(accepted))
 	branch = append(branch, confirmed...)
-	branch = append(branch, candidate.Recovered...)
+	branch = append(branch, accepted...)
+	sort.Slice(branch, func(i, j int) bool { return branch[i].Version < branch[j].Version })
 
-	// Write the branch log to a temporary file first, then move the original
+	// Write the branch log to a temporary file first, then move the current
 	// log aside and publish the branch, so an interruption never loses both.
 	tmpPath := s.path + ".branch.tmp"
 	tmp, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
@@ -307,37 +396,57 @@ func (s *FileEventStore) ConfirmRecovery(candidate RecoveryCandidate, materials 
 		return fmt.Errorf("replay: close branch log: %w", err)
 	}
 
-	originalPath := s.path + ".original"
+	// The first confirmation preserves the damaged original log; a later
+	// confirmation preserves the previous branch next to it.
+	asidePath := s.path + ".original"
+	if s.recovery != nil {
+		asidePath = s.path + ".previous"
+	}
 	for n := 1; ; n++ {
-		if _, err := os.Stat(originalPath); os.IsNotExist(err) {
+		if _, err := os.Stat(asidePath); os.IsNotExist(err) {
 			break
 		}
-		originalPath = fmt.Sprintf("%s.original-%d", s.path, n)
+		if s.recovery != nil {
+			asidePath = fmt.Sprintf("%s.previous-%d", s.path, n)
+		} else {
+			asidePath = fmt.Sprintf("%s.original-%d", s.path, n)
+		}
 	}
 	if err := s.log.Close(); err != nil {
 		return fmt.Errorf("replay: close original event log: %w", err)
 	}
-	if err := os.Rename(s.path, originalPath); err != nil {
+	if err := os.Rename(s.path, asidePath); err != nil {
 		return fmt.Errorf("replay: preserve original event log: %w", err)
 	}
 	if err := os.Rename(tmpPath, s.path); err != nil {
 		return fmt.Errorf("replay: publish branch log: %w", err)
 	}
 
-	record := &RecoveryRecord{
-		StreamID:         streamID,
-		OriginalFile:     filepath.Base(originalPath),
-		ConfirmedThrough: headVersionLocked(confirmed),
-		Damage:           *s.damage,
-		MaterialDigests:  make(map[string]string),
-		Gaps:             candidate.Gaps,
-		RecoveredThrough: headVersionLocked(branch),
-		RecoveredAt:      s.now().UTC(),
+	var record *RecoveryRecord
+	if s.recovery == nil {
+		record = &RecoveryRecord{
+			StreamID:         streamID,
+			OriginalFile:     filepath.Base(asidePath),
+			ConfirmedThrough: headVersionLocked(confirmed),
+			Damage:           *s.damage,
+			MaterialDigests:  make(map[string]string),
+			Generation:       1,
+		}
+	} else {
+		record = s.recovery
+		record.Generation++
 	}
+	record.Gaps = append([]VersionRange(nil), gaps...)
+	record.RecoveredThrough = headVersionLocked(branch)
+	record.RecoveredAt = s.now().UTC()
+	record.CandidateVersion = candidate.Version
 	for _, material := range materials {
 		record.MaterialDigests[material.Source] = DigestMaterial(material)
 	}
-	for _, event := range candidate.Recovered {
+	if underReview {
+		record.Decisions = append([]ReviewDecision(nil), s.review.Decisions...)
+	}
+	for _, event := range accepted {
 		if event.ID > s.nextID {
 			s.nextID = event.ID
 		}
@@ -353,10 +462,38 @@ func (s *FileEventStore) ConfirmRecovery(candidate RecoveryCandidate, materials 
 	s.log = log
 	s.offset = int64(len(buf))
 	s.streams[streamID] = branch
-	s.gaps[streamID] = append([]VersionRange(nil), candidate.Gaps...)
+	s.gaps[streamID] = append([]VersionRange(nil), gaps...)
 	s.recovery = record
 	s.damage = nil
+	if underReview {
+		s.review.Recovered = nil
+		s.review.Gaps = append([]VersionRange(nil), gaps...)
+		s.review.ConfirmedThrough = headVersionLocked(branch)
+		if err := s.persistReviewStateLocked(); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// normalizeGaps sorts gap ranges and merges overlapping or adjacent ones.
+func normalizeGaps(gaps []VersionRange) []VersionRange {
+	if len(gaps) == 0 {
+		return nil
+	}
+	sorted := append([]VersionRange(nil), gaps...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].From < sorted[j].From })
+	merged := sorted[:0]
+	for _, r := range sorted {
+		if n := len(merged); n > 0 && r.From <= merged[n-1].To+1 {
+			if r.To > merged[n-1].To {
+				merged[n-1].To = r.To
+			}
+			continue
+		}
+		merged = append(merged, r)
+	}
+	return merged
 }
 
 // persistRecoveryRecord writes the recovery basis with the same

@@ -9,6 +9,9 @@
 - 重开时明确区分两种异常：末尾半写入直接截断隔离；已确认记录的完整帧校验失败则判定为已确认内容损坏，保留损坏字节、阻止新追加并通过 `Damage`/`OpenReport` 报告给操作者，绝不静默回退伪装成正常尾部。
 - 损坏后可用 `BuildRecoveryCandidate` 对照另存的可信材料生成恢复候选视图：能核对的版本进入恢复集，无法覆盖或材料互相冲突的版本保留为缺口，不补造连续历史。
 - 操作者确认后 `ConfirmRecovery` 从候选形成新分支：原日志另存为 `events.log.original`，恢复依据（原确认范围、损坏事实、材料摘要、缺口）持久化到 `events.recovery.json`；重开后仍提供恢复视图。
+- 恢复方案支持多轮审核：操作者用 `SubmitReviewDecision` 对候选中的不同损坏区间分别接受、拒绝或暂缓，并记录所依据的材料与理由；已接受的区间再次提交相同决定是幂等的，提交不同决定会被拒绝。审核进度持久化到 `events.review.json`，保存重开后可继续审核。
+- 后续补充材料只会形成新的候选版本（`RecoveryCandidate.Version` 递增），不会悄悄改写先前确认的恢复分支；`CompareCandidateWithConfirmed` 给出新候选与已确认分支的差异（新恢复版本、消除的缺口、剩余缺口），确认新版本前必须为每个新恢复版本提交明确决定。
+- `ReviewState`/`StreamView.Review` 展示部分区间已确认、其余区间仍保留缺口或待决定的进度；`RecoveryRecord` 记录全部决定、分支世代（`Generation`）与对应的候选版本。
 - `ReadStreamWithView`/`View` 的读取结果说明属于原始历史视图还是恢复分支视图，并携带缺口与恢复依据。
 - `FileSnapshotStore` 先写临时文件、fsync 再原子 rename 发布快照；写入、发布或切换任一阶段中断都保留上一份可用快照。
 - 投影严格要求事件版本连续，坏事件处理失败后立即停止，不越过事件继续提交。
