@@ -78,6 +78,9 @@ type RecoveryRecord struct {
 	Gaps             []VersionRange    `json:"gaps,omitempty"`
 	RecoveredThrough int64             `json:"recovered_through"`
 	RecoveredAt      time.Time         `json:"recovered_at"`
+	// Decisions records the operator review decisions (range, action,
+	// reason, material) this branch was confirmed from, if any.
+	Decisions []RangeDecision `json:"decisions,omitempty"`
 }
 
 // ViewKind identifies which history a read result belongs to.
@@ -179,6 +182,12 @@ func (s *FileEventStore) ReadStreamWithView(ctx context.Context, streamID string
 func (s *FileEventStore) BuildRecoveryCandidate(streamID string, materials ...RecoveryMaterial) (RecoveryCandidate, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.buildRecoveryCandidateLocked(streamID, materials...)
+}
+
+// buildRecoveryCandidateLocked builds the candidate while the caller holds
+// the store mutex (see BuildRecoveryCandidate).
+func (s *FileEventStore) buildRecoveryCandidateLocked(streamID string, materials ...RecoveryMaterial) (RecoveryCandidate, error) {
 	if s.damage == nil {
 		return RecoveryCandidate{}, fmt.Errorf("replay: no committed corruption to recover from")
 	}
@@ -258,6 +267,12 @@ func (s *FileEventStore) BuildRecoveryCandidate(streamID string, materials ...Re
 func (s *FileEventStore) ConfirmRecovery(candidate RecoveryCandidate, materials ...RecoveryMaterial) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.confirmRecoveryLocked(candidate, materials...)
+}
+
+// confirmRecoveryLocked forms the recovery branch while the caller holds the
+// store mutex (see ConfirmRecovery).
+func (s *FileEventStore) confirmRecoveryLocked(candidate RecoveryCandidate, materials ...RecoveryMaterial) error {
 	if s.damage == nil {
 		return fmt.Errorf("replay: no committed corruption to recover from")
 	}

@@ -39,6 +39,7 @@ type FileEventStore struct {
 	damage        *Damage
 	truncatedTail bool
 	recovery      *RecoveryRecord
+	review        *ReviewRecord
 	gaps          map[string][]VersionRange
 	now           func() time.Time
 }
@@ -73,6 +74,10 @@ func OpenFileEventStore(dir string) (*FileEventStore, error) {
 		return nil, err
 	}
 	if err := store.loadRecoveryRecord(); err != nil {
+		log.Close()
+		return nil, err
+	}
+	if err := store.loadReviewRecord(); err != nil {
 		log.Close()
 		return nil, err
 	}
